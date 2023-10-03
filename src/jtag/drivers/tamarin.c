@@ -73,10 +73,6 @@ struct tamarin_cmd_hdr_enc {
 	uint32_t *data;
 };
 
-// Random value that performs well enough
-#define TAMARIN_QUEUE_SIZE 64
-
-
 #define VID 0x2B3E /* Raspberry Pi */
 #define PID 0x0004 /* Picoprobe */
 
@@ -92,8 +88,9 @@ struct tamarin_cmd_hdr_enc {
 struct tamarin {
 	jtag_libusb_device_handle *usb_handle;
 	int freq;
-	struct tamarin_cmd_hdr_enc queue[TAMARIN_QUEUE_SIZE];
-	size_t queue_length;
+	struct tamarin_cmd_hdr_enc *queue;
+	size_t queue_size;
+	size_t queue_elements;
 };
 
 static int queued_retval;
@@ -131,11 +128,11 @@ struct tamarin_queue_entry {
 
 static int tamarin_swd_run_queue(void)
 {
-	LOG_DEBUG_IO("Executing %zu queued transactions", tamarin_handle->queue_length);
+	LOG_DEBUG_IO("Executing %zu queued transactions", tamarin_handle->queue_elements);
 
 
 	// yes this is slow as fuck
-	for(size_t i = 0; i < tamarin_handle->queue_length; i++) {
+	for(size_t i = 0; i < tamarin_handle->queue_elements; i++) {
 		// sleep(0.1);
 		struct tamarin_res_hdr result;
 		struct tamarin_cmd_hdr_enc *command_enc = &tamarin_handle->queue[i];
@@ -154,7 +151,7 @@ static int tamarin_swd_run_queue(void)
 			sizeof(struct tamarin_res_hdr), LIBUSB_TIMEOUT);
 		if(ret < 0) {
 			LOG_DEBUG("BULK READ FAILED");
-			tamarin_handle->queue_length = 0;
+			tamarin_handle->queue_elements = 0;
 			return ERROR_JTAG_DEVICE_ERROR;
 		}
 		// LOG_DEBUG("READ DONE");
@@ -163,7 +160,7 @@ static int tamarin_swd_run_queue(void)
         // TODO: Handle errors better here.
 		if(result.res == 4) {
 			LOG_DEBUG("FAIL FAIL FAIL\n");
-			tamarin_handle->queue_length = 0;
+			tamarin_handle->queue_elements = 0;
 			return ERROR_TARGET_FAILURE;
 		}
 		if((command->cmd == TAMARIN_READ) && (command_enc->data != NULL)) {
@@ -174,7 +171,7 @@ static int tamarin_swd_run_queue(void)
 	}
 
 
-	tamarin_handle->queue_length = 0;
+	tamarin_handle->queue_elements = 0;
 
 	queued_retval = ERROR_OK;
 	return ERROR_OK;
@@ -183,9 +180,6 @@ static int tamarin_swd_run_queue(void)
 static void tamarin_swd_read_reg(uint8_t cmd, uint32_t *value, uint32_t ap_delay_clk)
 {
 	assert(cmd & SWD_CMD_RnW);
-	// Et hätt noch immer jot jejange.
-	assert(tamarin_handle->queue_length < TAMARIN_QUEUE_SIZE-1);
-
 	struct tamarin_cmd_hdr command = {
 		.id = 0,
 		.cmd = TAMARIN_READ,
@@ -200,15 +194,18 @@ static void tamarin_swd_read_reg(uint8_t cmd, uint32_t *value, uint32_t ap_delay
 	};
 
 	LOG_DEBUG("Enqueue read: 0x%02X", cmd);
-	tamarin_handle->queue[tamarin_handle->queue_length] = command_enc;
-	tamarin_handle->queue_length++;
+	if (tamarin_handle->queue_size < tamarin_handle->queue_elements+1){
+		size_t newsize = tamarin_handle->queue_size*1.5;
+		tamarin_handle->queue = realloc(tamarin_handle->queue,newsize * sizeof(struct tamarin_cmd_hdr_enc));
+		tamarin_handle->queue_size = newsize;
+	}
+	tamarin_handle->queue[tamarin_handle->queue_elements] = command_enc;
+	tamarin_handle->queue_elements++;
 }
 
 static void tamarin_swd_write_reg(uint8_t cmd, uint32_t value, uint32_t ap_delay_clk)
 {
 	assert(!(cmd & SWD_CMD_RnW));
-	assert(tamarin_handle->queue_length < TAMARIN_QUEUE_SIZE-1);
-
 	struct tamarin_cmd_hdr command = {
 		.id = 0,
 		.cmd = TAMARIN_WRITE,
@@ -223,8 +220,8 @@ static void tamarin_swd_write_reg(uint8_t cmd, uint32_t value, uint32_t ap_delay
 	};
 
 	LOG_DEBUG("Enqueue write: 0x%02X - 0x%08X", cmd, value);
-	tamarin_handle->queue[tamarin_handle->queue_length] = command_enc;
-	tamarin_handle->queue_length++;
+	tamarin_handle->queue[tamarin_handle->queue_elements] = command_enc;
+	tamarin_handle->queue_elements++;
 }
 
 static int_least32_t tamarin_set_frequency(int_least32_t hz)
@@ -243,8 +240,8 @@ static int_least32_t tamarin_set_frequency(int_least32_t hz)
 	};
 
 	LOG_DEBUG("Enqueue set frequency: %d", hz/1000);
-	tamarin_handle->queue[tamarin_handle->queue_length] = command_enc;
-	tamarin_handle->queue_length++;
+	tamarin_handle->queue[tamarin_handle->queue_elements] = command_enc;
+	tamarin_handle->queue_elements++;
 
 
 	// TODO: Flush
@@ -299,8 +296,13 @@ static int tamarin_line_reset() {
 
 
 	LOG_DEBUG("Enqueue line reset / SWD-to-JTAG sequence");
-	tamarin_handle->queue[tamarin_handle->queue_length] = command_enc;
-	tamarin_handle->queue_length++;
+	if (tamarin_handle->queue_size < tamarin_handle->queue_elements+1){
+		size_t newsize = tamarin_handle->queue_size*1.5;
+		tamarin_handle->queue = realloc(tamarin_handle->queue,newsize * sizeof(struct tamarin_cmd_hdr_enc));
+		tamarin_handle->queue_size = newsize;
+	}
+	tamarin_handle->queue[tamarin_handle->queue_elements] = command_enc;
+	tamarin_handle->queue_elements++;
 	return ERROR_OK;
 }
 
@@ -411,8 +413,9 @@ static int tamarin_init(void)
 		return ERROR_JTAG_INIT_FAILED;
 	}
 
-
-	tamarin_handle->queue_length = 0;
+	tamarin_handle->queue = (struct tamarin_cmd_hdr_enc *)calloc(64, sizeof(struct tamarin_cmd_hdr_enc));
+	tamarin_handle->queue_size = 64;
+	tamarin_handle->queue_elements = 0;
     
     return ERROR_OK;
 }
@@ -421,5 +424,9 @@ static int tamarin_init(void)
 static int tamarin_quit(void)
 {
 	tamarin_usb_close();
+	free(tamarin_handle->queue);
+	tamarin_handle->queue = NULL;
+	tamarin_handle->queue_size = 0;
+	free(tamarin_handle);
 	return ERROR_OK;
 }
